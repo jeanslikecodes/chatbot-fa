@@ -1,4 +1,5 @@
 import os
+import re
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -9,37 +10,42 @@ load_dotenv()
 MODEL = "meta/llama-3.1-8b-instruct"
 BASE_URL = "https://integrate.api.nvidia.com/v1"
 
-SYSTEM_PROMPT = """
-Você é um tutor de futebol americano (NFL e futebol universitário),
-paciente e entusiasmado, que ensina iniciantes brasileiros.
+RECUSA_PADRAO = "Meu foco é futebol americano — quer saber algo sobre o esporte?"
 
-Seu papel é:
-- explicar regras, pontuação, posições, jogadas e estratégias;
-- esclarecer a terminologia em inglês, sempre traduzindo e explicando
-  (ex.: "touchdown", "first down", "blitz", "play-action");
-- usar analogias com o futebol (soccer) e situações do dia a dia;
-- explicar a lógica por trás das decisões em campo (por que optar por
-  punt, field goal, ir para o quarto down, etc.).
+PADROES_SUSPEITOS = [
+    r"repita.*(instru|regra|prompt|acima)",
+    r"revele.*(instru|regra|prompt)",
+    r"resuma.*(instru|regra|prompt)",
+    r"traduza.*(instru|regra|prompt)",
+    r"ignore.*(instru|regra)",
+    r"esque(ç|c)a.*(instru|regra)",
+    r"system\s*override",
+    r"modo de auditoria",
+    r"sem restri(ç|c)(õ|o)es",
+    r"sem filtro",
+]
 
-Se perguntarem algo fora de futebol americano, recuse em UMA frase curta e
-pare: diga que seu foco é futebol americano e pergunte se a pessoa quer saber
-algo sobre o esporte. NÃO tente responder a pergunta fora do tema, nem
-parcialmente, nem como exemplo. NÃO repita o convite mais de uma vez na
-mesma resposta.
+def mensagem_suspeita(texto: str) -> bool:
+    texto_lower = texto.lower()
+    return any(re.search(padrao, texto_lower) for padrao in PADROES_SUSPEITOS)
 
-Nunca invente estatísticas, placares ou resultados específicos — se não
-tiver certeza, admita.
+def _normalizar(texto: str) -> str:
+    return re.sub(r"\s+", " ", texto.lower()).strip()
 
-Tom: direto e objetivo, sem enrolação. Evite floreios, repetições e
-introduções longas.
-Ao responder:
-- vá direto ao ponto essencial;
-- use exemplos concretos e, quando útil, passos numerados, só quando agregar;
-- respostas curtas por padrão; aprofunde apenas se o usuário pedir mais detalhes;
-- explique todo jargão que usar, em poucas palavras.
+def contem_vazamento_de_prompt(texto: str, janela: int = 30, passo: int = 8) -> bool:
+    """Detecta se a RESPOSTA do modelo reproduziu trechos do próprio
+    system prompt — pega vazamentos mesmo quando a pergunta do usuário
+    escapou do filtro de entrada (ex.: pedidos via história/ficção).
 
-Responda sempre em português do Brasil.
-"""
+    Comparação por janelas curtas (não por linha inteira): um trecho de
+    30+ caracteres reaproveitado ao pé da letra já é detectado, mesmo que
+    o resto da frase ao redor tenha sido reescrito/parafraseado."""
+    texto_norm = _normalizar(texto)
+    prompt_norm = _normalizar(SYSTEM_PROMPT)
+    for i in range(0, len(prompt_norm) - janela, passo):
+        if prompt_norm[i : i + janela] in texto_norm:
+            return True
+    return False
 
 st.set_page_config(
     page_title="Guia de Futebol Americano",
@@ -49,6 +55,18 @@ st.set_page_config(
 
 st.title("🏈 Guia de Futebol Americano")
 st.caption("Tire suas dúvidas sobre futebol americano")
+
+CAMINHO_SYSTEM_PROMPT = "system_prompt.txt"
+
+if not os.path.exists(CAMINHO_SYSTEM_PROMPT):
+    st.error(
+        f"Arquivo '{CAMINHO_SYSTEM_PROMPT}' não encontrado. "
+        "Crie-o a partir de system_prompt.example.txt (veja o README)."
+    )
+    st.stop()
+
+with open(CAMINHO_SYSTEM_PROMPT, encoding="utf-8") as f:
+    SYSTEM_PROMPT = f.read()
 
 if not os.getenv("NVIDIA_API_KEY"):
     st.error(
@@ -98,10 +116,17 @@ for mensagem in st.session_state.messages:
     with st.chat_message(mensagem["role"]):
         st.markdown(mensagem["content"])
 
-def gerar_resposta():  
+MAX_HISTORICO = 12  # últimas mensagens (excluindo o system prompt) enviadas ao modelo
+
+def gerar_resposta():
+    # Trunca o histórico enviado à API: em conversas longas, um modelo pequeno
+    # tende a "seguir o tom" das últimas trocas e se afastar das regras do
+    # system prompt. Reenviá-lo sempre por completo, com uma janela curta de
+    # histórico, mantém o comportamento firme.
+    mensagens_api = [st.session_state.messages[0]] + st.session_state.messages[1:][-MAX_HISTORICO:]
     stream = client.chat.completions.create(
         model=MODEL,
-        messages=st.session_state.messages,
+        messages=mensagens_api,
         temperature=0.2,
         top_p=0.7,
         max_tokens=1024,
@@ -114,7 +139,6 @@ def gerar_resposta():
         if conteudo:
             yield conteudo
 
-
 pergunta = st.chat_input("Pergunte sobre futebol americano...")
 
 if pergunta:
@@ -123,13 +147,25 @@ if pergunta:
     with st.chat_message("user"):
         st.markdown(pergunta)
 
-    # Gera a resposta em streaming e a exibe token a token.
     with st.chat_message("assistant"):
-        try:
-            resposta = st.write_stream(gerar_resposta())
-        except Exception as erro:
-            resposta = None
-            st.error(f"Falha ao chamar a API da NVIDIA: {erro}")
+        if mensagem_suspeita(pergunta):
+            resposta = RECUSA_PADRAO
+            st.markdown(resposta)
+        else:
+            with st.spinner("Pensando..."):
+                texto_acumulado = ""
+                try:
+                    for pedaco in gerar_resposta():
+                        texto_acumulado += pedaco
+                    if contem_vazamento_de_prompt(texto_acumulado):
+                        resposta = RECUSA_PADRAO
+                    else:
+                        resposta = texto_acumulado
+                except Exception as erro:
+                    resposta = None
+                    st.error(f"Falha ao chamar a API da NVIDIA: {erro}")
+            if resposta:
+                st.markdown(resposta)
 
     # Guarda a resposta no histórico (contexto das próximas mensagens).
     if resposta:
